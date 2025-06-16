@@ -14,4 +14,14 @@ class WodClusterPostBodyDto(BaseModel):
 async def getWodClusterPrediction(body: WodClusterPostBodyDto):
     loop = asyncio.get_event_loop()
     clusters = await loop.run_in_executor(None, predictCluster, body.wods, body.weights)
-    return {"clusters": clusters}
+
+    cluster_labels = {
+        0: "Endurance",
+        1: "Cardio",
+        2: "Strength",
+        3: "Volume"
+    }
+
+    labels = [cluster_labels.get(c, "Unknown") for c in clusters]
+
+    return {"labels": labels}
