@@ -1,0 +1,86 @@
+name: CI/CD
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Validate sources compile
+        run: python -m compileall src
+
+  deploy:
+    name: Deploy to EC2
+    needs: build
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    env:
+      EC2_HOST: ${{ secrets.EC2_HOST }}
+      EC2_USER: ${{ secrets.EC2_USER }}
+      EC2_TARGET_DIR: ${{ secrets.EC2_TARGET_DIR }}
+      EC2_SERVICE_NAME: ${{ secrets.EC2_SERVICE_NAME }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Configure SSH
+        uses: webfactory/ssh-agent@v0.8.0
+        with:
+          ssh-private-key: ${{ secrets.EC2_SSH_KEY }}
+
+      - name: Add EC2 host to known hosts
+        run: |
+          mkdir -p ~/.ssh
+          ssh-keyscan -H "$EC2_HOST" >> ~/.ssh/known_hosts
+
+      - name: Create deployment archive
+        run: |
+          tar czf release.tar.gz \
+            --exclude='.git' \
+            --exclude='.github/workflows' \
+            --exclude='*.pyc' \
+            --exclude='__pycache__' \
+            .
+
+      - name: Upload archive to EC2
+        run: scp release.tar.gz "${EC2_USER}@${EC2_HOST}:/tmp/wodfit-ml-release.tar.gz"
+
+      - name: Deploy on EC2 instance
+        run: |
+          ssh "${EC2_USER}@${EC2_HOST}" <<EOF
+          set -euo pipefail
+
+          TARGET_DIR="${EC2_TARGET_DIR}"
+          ARCHIVE_PATH="/tmp/wodfit-ml-release.tar.gz"
+
+          mkdir -p "${TARGET_DIR}"
+          tar xzf "${ARCHIVE_PATH}" -C "${TARGET_DIR}" --strip-components=1
+          rm -f "${ARCHIVE_PATH}"
+
+          python3 -m venv "${TARGET_DIR}/.venv"
+          source "${TARGET_DIR}/.venv/bin/activate"
+          python -m pip install --upgrade pip
+          pip install -r "${TARGET_DIR}/requirements.txt"
+
+          if [ -n "${EC2_SERVICE_NAME}" ]; then
+            sudo systemctl daemon-reload || true
+            sudo systemctl restart "${EC2_SERVICE_NAME}"
+          fi
+          EOF
