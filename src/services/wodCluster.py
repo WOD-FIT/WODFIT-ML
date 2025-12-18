@@ -5,6 +5,7 @@ import os
 import pickle
 from typing import Iterable, Optional, Sequence, Tuple
 
+import mlflow
 import numpy as np
 import scipy
 from sklearn.feature_extraction.text import TfidfVectorizer
@@ -18,6 +19,8 @@ except ImportError:  # pragma: no cover
     redis = None  # type: ignore
     RedisError = Exception  # type: ignore
 
+logger = logging.getLogger(__name__)
+
 CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))         # .../src/services
 PROJECT_ROOT = os.path.abspath(os.path.join(CURRENT_DIR, "..", ".."))  # .../WodCluster
 
@@ -30,7 +33,19 @@ with open(MODEL_PATH, "rb") as f:
     scaler: StandardScaler = loaded_model["scaler"]
 
 
-logger = logging.getLogger(__name__)
+MLFLOW_TRACKING_URI = os.getenv("MLFLOW_TRACKING_URI")
+MLFLOW_EXPERIMENT_NAME = os.getenv("MLFLOW_EXPERIMENT_NAME", "wodfit-ml")
+MLFLOW_RUN_NAME = os.getenv("MLFLOW_RUN_NAME", "wod-cluster-prediction")
+
+_mlflow_enabled = False
+
+if MLFLOW_TRACKING_URI:
+    mlflow.set_tracking_uri(MLFLOW_TRACKING_URI)
+    try:
+        mlflow.set_experiment(MLFLOW_EXPERIMENT_NAME)
+        _mlflow_enabled = True
+    except Exception as exc:  # pragma: no cover - remote MLflow connection failure
+        logger.warning("Failed to configure MLflow tracking: %s", exc)
 
 
 def _parse_cache_ttl(value: Optional[str]) -> int:
@@ -166,6 +181,37 @@ def _store_cached_predictions(cache_key: str, predictions: list[int]) -> None:
         logger.warning("Redis set failed for key %s: %s", cache_key, exc)
 
 
+def _log_prediction_event(wods: list[str], weights: list[float], predictions: list[int], cache_hit: bool) -> None:
+    if not _mlflow_enabled:
+        return
+
+    try:
+        with mlflow.start_run(run_name=MLFLOW_RUN_NAME, nested=True):
+            mlflow.log_params(
+                {
+                    "cache_hit": cache_hit,
+                    "num_wods": len(wods),
+                }
+            )
+            mlflow.log_metric("unique_clusters", len(set(predictions)))
+            mlflow.set_tags(
+                {
+                    "model_path": MODEL_PATH,
+                    "model_class": wod_cluster.__class__.__name__,
+                }
+            )
+            mlflow.log_dict(
+                {
+                    "wods": wods,
+                    "weights": weights,
+                    "predictions": predictions,
+                },
+                "prediction_payload.json",
+            )
+    except Exception as exc:  # pragma: no cover - logging must not block inference
+        logger.warning("Failed to log prediction to MLflow: %s", exc)
+
+
 def predictCluster(wods: list[str], weights: list[float]):
     validated_wods, validated_weights = _validate_inputs(wods, weights)
     normalized_weights = validated_weights.reshape(-1).astype(float).tolist()
@@ -173,9 +219,11 @@ def predictCluster(wods: list[str], weights: list[float]):
 
     cached_predictions = _fetch_cached_predictions(cache_key)
     if cached_predictions is not None:
+        _log_prediction_event(validated_wods, normalized_weights, cached_predictions, cache_hit=True)
         return cached_predictions
 
     processed = _prepare_features(validated_wods, validated_weights)
     preds = wod_cluster.predict(processed).tolist()
     _store_cached_predictions(cache_key, preds)
+    _log_prediction_event(validated_wods, normalized_weights, preds, cache_hit=False)
     return preds
