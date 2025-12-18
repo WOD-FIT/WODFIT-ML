@@ -1,9 +1,0 @@
-fastapi
-numpy
-scikit-learn
-scipy
-uvicorn
-pandas
-selenium
-redis
-mlflow
